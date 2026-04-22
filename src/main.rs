@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::{
     Router,
@@ -12,7 +11,6 @@ use axum::{
 use minijinja::{Environment, context};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-use tokio::sync::RwLock;
 
 // Data model
 
@@ -32,12 +30,6 @@ struct CreateBookmarkForm {
     tags: Option<String>,
 }
 
-#[derive(Default)]
-struct BookmarkStore {
-    next_id: u64,
-    bookmarks: HashMap<u64, Bookmark>,
-}
-
 // Application state
 
 /// Everything handlers need: the data store **and** the template engine.
@@ -49,6 +41,15 @@ struct AppState {
     // the bookmark store is now a database connection
     store: SqlitePool,
     templates: Arc<Environment<'static>>,
+}
+
+// Create a database error response
+fn database_error() -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Html("database error".to_string()),
+    )
+        .into_response()
 }
 
 // Templating
@@ -102,7 +103,7 @@ fn render(env: &Environment, name: &str, ctx: minijinja::Value) -> Response {
 // helper for list bookmarks so we can consolidate DB errors
 async fn get_all_bookmarks(pool: &SqlitePool) -> sqlx::Result<Vec<Bookmark>> {
     let bookmarks =
-        sqlx::query_as::<_, (u64, String, String)>("select id, url, title from bookmarks")
+        sqlx::query_as::<_, (u64, String, String)>("select id, url, title from bookmark")
             .fetch_all(pool)
             .await?;
 
@@ -145,11 +146,7 @@ async fn get_all_bookmarks(pool: &SqlitePool) -> sqlx::Result<Vec<Bookmark>> {
 /// GET /bookmarks
 async fn list_bookmarks(State(state): State<AppState>) -> Response {
     let Ok(bookmarks) = get_all_bookmarks(&state.store).await else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Html("database error".to_string()),
-        )
-            .into_response();
+        return database_error();
     };
     render(&state.templates, "list.html", context! { bookmarks })
 }
@@ -162,12 +159,37 @@ async fn new_bookmark_form(State(state): State<AppState>) -> Response {
     render(&state.templates, "new.html", context! {})
 }
 
+async fn get_bookmark_from_id(pool: &SqlitePool, id: u64) -> sqlx::Result<Option<Bookmark>> {
+    let Some((id, url, title)) = sqlx::query_as::<_, (u64, String, String)>(
+        "select id, url, title from bookmark where id = ?",
+    )
+    .bind(id as i64)
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    let tags = sqlx::query_scalar::<_, String>(
+        "select tag.name from tag, bookmark_tag bt where tag.id = bt.tag_id and bt.bookmark_id = ?",
+    )
+    .bind(id as i64)
+    .fetch_all(pool)
+    .await?;
+    Ok(Some(Bookmark {
+        id,
+        url,
+        title,
+        tags,
+    }))
+}
+
 /// GET /bookmarks/:id
 async fn get_bookmark(State(state): State<AppState>, Path(id): Path<u64>) -> Response {
-    let store = state.read_store().await;
-    match store.bookmarks.get(&id) {
-        Some(bm) => render(&state.templates, "detail.html", context! { bookmark => bm }),
-        None => (
+    match get_bookmark_from_id(&state.store, id).await {
+        Err(_) => database_error(),
+        Ok(Some(bm)) => render(&state.templates, "detail.html", context! { bookmark => bm }),
+        Ok(None) => (
             StatusCode::NOT_FOUND,
             render(&state.templates, "404.html", context! {}),
         )
@@ -175,11 +197,51 @@ async fn get_bookmark(State(state): State<AppState>, Path(id): Path<u64>) -> Res
     }
 }
 
+// helper for creating a bookmark, returns the ID
+async fn create_bookmark_impl(
+    pool: &SqlitePool,
+    url: String,
+    title: String,
+    tags: Vec<String>,
+) -> sqlx::Result<i64> {
+    // TODO: transactions
+
+    let bookmark_id = sqlx::query_scalar::<_, i64>(
+        r"INSERT INTO bookmark (url, title) VALUES (?, ?) RETURNING id",
+    )
+    .bind(url)
+    .bind(title)
+    .fetch_one(pool)
+    .await?;
+
+    // create the tags
+    let placeholders = vec!["(?)"; tags.len()].join(", ");
+    let query_text = format!(r"insert or ignore into tag (name) values {placeholders}");
+    let insert_query = tags
+        .iter()
+        .fold(sqlx::query(&query_text), |query, tag| query.bind(tag));
+    insert_query.execute(pool).await?;
+
+    // create the links
+    let placeholders = vec!["?"; tags.len()].join(", ");
+    let link_tags = format!(
+        r"INSERT INTO bookmark_tag (bookmark_id, tag_id)
+              SELECT ?, id FROM tag WHERE name IN ({placeholders})"
+    );
+    let mut q = sqlx::query(&link_tags).bind(bookmark_id);
+    for tag in tags {
+        q = q.bind(tag);
+    }
+    q.execute(pool).await?;
+
+    Ok(bookmark_id)
+}
+
 /// POST /bookmarks
 async fn create_bookmark(
     State(state): State<AppState>,
     Form(form): Form<CreateBookmarkForm>,
-) -> Redirect {
+) -> Response {
     let tags: Vec<String> = form
         .tags
         .unwrap_or_default()
@@ -188,23 +250,11 @@ async fn create_bookmark(
         .filter(|t| !t.is_empty())
         .collect();
 
-    let id = {
-        let mut store = state.store.write().await;
-        let id = store.next_id;
-        store.next_id += 1;
-        store.bookmarks.insert(
-            id,
-            Bookmark {
-                id,
-                url: form.url,
-                title: form.title,
-                tags,
-            },
-        );
-        id
+    let Ok(id) = create_bookmark_impl(&state.store, form.url, form.title, tags).await else {
+        return database_error();
     };
 
-    Redirect::to(&format!("/bookmarks/{id}"))
+    Redirect::to(&format!("/bookmarks/{id}")).into_response()
 }
 
 fn build_router(state: AppState) -> Router {
@@ -221,20 +271,18 @@ fn build_router(state: AppState) -> Router {
 
 #[tokio::main]
 async fn main() {
+    let pool = SqlitePool::connect("sqlite:bookmarks.db?mode=rwc")
+        .await
+        .expect("Cannot connect to the database");
+    sqlx::raw_sql(include_str!("../schema.sql"))
+        .execute(&pool)
+        .await
+        .expect("Cannot create the schema");
+
     let state = AppState {
-        store: Arc::new(RwLock::new(BookmarkStore::default())),
+        store: pool,
         templates: Arc::new(build_templates()),
     };
-
-    // A background task that logs the store size every 30 seconds.
-    let bg = state.store.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            let store = bg.read().await;
-            println!("[background] {} bookmark(s)", store.bookmarks.len());
-        }
-    });
 
     let app = build_router(state);
 
