@@ -10,6 +10,10 @@ To start, create the example database by running `./mk-db.sh`.
 1. Modify the detail page to add a link to a delete endpoint.
 2. Create the delete endpoint, it should redirect to the `/bookmarks` page
    after success.
+   - During deletion, you need to first delete the links (entries in the
+     `bookmark_tag` table), and then the bookmark.
+   - Use transactions to make sure this is atomic.
+   - Use `rows_affected` to see whether a bookmark is deleted.
 
 ## Modifying a bookmark
 
